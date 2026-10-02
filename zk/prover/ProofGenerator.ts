@@ -3,10 +3,17 @@
  * @module zk/prover/ProofGenerator
  */
 
+import { zkApiHeaders } from '@/lib/utils/zk-api-auth';
 import path from 'path';
 import crypto from 'crypto';
 import { logger } from '../../shared/utils/logger';
 import { RiskAnalysis } from '../../shared/types/agent';
+import {
+  CanonicalRiskInputs,
+  RISK_CANONICAL_VERSION,
+  prepareRiskBinding,
+  type RiskBinding,
+} from './riskCanonical';
 
 export interface ZKProofInput {
   proofType: string;
@@ -21,6 +28,18 @@ export interface ZKProof {
   verified: boolean;
   generationTime: number;
   protocol: string;
+  /**
+   * Present when the proof was generated with canonical binding (risk
+   * proofs since v1). Contains the hashes the STARK statement pins.
+   * Consumers should attach this to `RiskAnalysis.zkBinding` and pass
+   * `commitmentHash` to on-chain verification.
+   */
+  binding?: {
+    inputsHash: string;
+    outputHash: string;
+    commitmentHash: string;
+    canonicalVersion: typeof RISK_CANONICAL_VERSION;
+  };
 }
 
 /**
@@ -37,29 +56,104 @@ export class ProofGenerator {
   }
 
   /**
-   * Generate ZK-STARK proof for risk calculation
+   * Generate ZK-STARK proof for risk calculation with cryptographic
+   * binding between the reported `totalRisk` and the inputs that
+   * produced it.
+   *
+   * The caller MUST provide `CanonicalRiskInputs`. Every numeric input
+   * is folded into `inputsHash`, and the STARK statement's
+   * `public_inputs` array pins `[inputsHash, outputHash, totalRisk,
+   * threshold]` — mutating any of these post-hoc invalidates the proof.
+   *
+   * The Python prover asserts three things before generating the trace:
+   *   1. sha256(canonical_json(witness)) === inputsHash
+   *   2. base_risk_score(volatility, exposures) === witness.baseRiskScore
+   *   3. fuse(base, ai) === witness.totalRisk
+   * Any mismatch causes a proof-generation error, so a honest prover
+   * can only produce a proof for a self-consistent (input → output)
+   * tuple.
+   *
+   * The returned `ZKProof.binding` field should be attached to
+   * `RiskAnalysis.zkBinding` by the caller for downstream verification.
    */
-  async generateRiskProof(riskAnalysis: RiskAnalysis): Promise<ZKProof> {
-    logger.info('Generating ZK-STARK proof for risk calculation', {
+  async generateRiskProof(
+    riskAnalysis: RiskAnalysis,
+    canonical: CanonicalRiskInputs,
+  ): Promise<ZKProof> {
+    logger.info('Generating bound ZK-STARK proof for risk calculation', {
       portfolioId: riskAnalysis.portfolioId,
+      canonicalVersion: canonical.version,
     });
 
+    // Cross-check the analysis vs the canonical inputs. The two arrive
+    // through separate call paths — a mismatch means the caller built
+    // the canonical struct incorrectly and the proof would silently
+    // certify the wrong tuple.
+    if (canonical.portfolioId !== riskAnalysis.portfolioId) {
+      throw new Error(
+        `[ZK-RISK] portfolioId mismatch: analysis=${riskAnalysis.portfolioId} canonical=${canonical.portfolioId}`,
+      );
+    }
+    if (canonical.totalRisk !== Math.round(riskAnalysis.totalRisk)) {
+      throw new Error(
+        `[ZK-RISK] totalRisk mismatch: analysis=${Math.round(riskAnalysis.totalRisk)} canonical=${canonical.totalRisk}`,
+      );
+    }
+    if (canonical.version !== RISK_CANONICAL_VERSION) {
+      throw new Error(
+        `[ZK-RISK] canonical version mismatch: expected ${RISK_CANONICAL_VERSION}, got ${canonical.version}`,
+      );
+    }
+
+    const binding: RiskBinding = prepareRiskBinding(canonical);
+
+    // Public statement — everything a verifier gets to see.
+    // `public_inputs` is what the STARK's `statement_hash` folds in.
+    // Order is byte-critical: it must match what Python uses to
+    // recompute the expected statement_hash during verification.
     const statement = {
-      claim: 'Portfolio risk is below threshold',
-      threshold: 100,
+      claim: `zkv-risk-v${RISK_CANONICAL_VERSION}`,
+      public_inputs: [
+        binding.inputsHash,
+        binding.outputHash,
+        String(canonical.totalRisk),
+        String(canonical.threshold),
+      ],
+      // Public metadata — surfaced on-chain / to humans. As of the
+      // 2026-07-27 statement_hash canonicalization fix, the WHOLE
+      // statement folds into statement_hash (not just claim + public_inputs),
+      // so any drift in public_data between prove and verify time will
+      // reject at verification. Callers must pass the identical statement
+      // dict at verify() that was passed at generate().
       public_data: {
-        portfolioId: riskAnalysis.portfolioId,
-        timestamp: riskAnalysis.timestamp.toISOString(),
+        portfolioId: canonical.portfolioId,
+        chain: canonical.chain,
+        timestampMs: canonical.timestampMs,
+        canonicalVersion: canonical.version,
+        commitmentHash: binding.commitmentHash,
       },
     };
 
+    // Private witness — the full canonical struct, sent to Python for
+    // assertion-based binding. Python recomputes inputsHash from
+    // canonical_json(witness) and rejects on mismatch.
     const witness = {
-      secret_value: Math.floor(riskAnalysis.totalRisk),
-      volatility: riskAnalysis.volatility,
-      portfolio_value: 10000000, // $10M example
+      canonical, // full nested object, mirrors CanonicalRiskInputs
+      // Legacy field kept so existing prover paths still find a
+      // `secret_value`; identical to totalRisk.
+      secret_value: canonical.totalRisk,
     };
 
-    return await this.generateProof('risk', statement, witness);
+    const proof = await this.generateProof('risk', statement, witness);
+
+    proof.binding = {
+      inputsHash: binding.inputsHash,
+      outputHash: binding.outputHash,
+      commitmentHash: binding.commitmentHash,
+      canonicalVersion: RISK_CANONICAL_VERSION,
+    };
+
+    return proof;
   }
 
   /**
@@ -141,7 +235,7 @@ export class ProofGenerator {
       // Submit proof generation request
       const resp = await fetch(`${zkApiUrl}/api/zk/generate`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: zkApiHeaders(),
         body: JSON.stringify({ 
           proof_type: supportedScenario,
           scenario: supportedScenario,
@@ -166,7 +260,7 @@ export class ProofGenerator {
         while (Date.now() - startTime < timeout) {
           const statusResp = await fetch(`${zkApiUrl}/api/zk/proof/${result.job_id}`, {
             method: 'GET',
-            headers: { 'Content-Type': 'application/json' },
+            headers: zkApiHeaders(),
           });
           
           if (!statusResp.ok) {
@@ -249,47 +343,6 @@ export class ProofGenerator {
     
     // Default fallback
     return 'risk-calculation';
-  }
-
-  /**
-   * Generate mock proof for development/testing
-   */
-  private generateMockProof(
-    proofType: string,
-    statement: Record<string, unknown>
-  ): ZKProof {
-    logger.warn('Using mock ZK proof for development', { proofType });
-
-    const mockProof = {
-      version: 'STARK-1.0-MOCK',
-      trace_length: 1024,
-      extended_trace_length: 4096,
-      blowup_factor: 4,
-      trace_merkle_root: this.hashProofSync(statement).substring(0, 64),
-      fri_roots: [
-        this.hashProofSync({ ...statement, layer: 0 }).substring(0, 64),
-        this.hashProofSync({ ...statement, layer: 1 }).substring(0, 64),
-      ],
-      fri_final_polynomial: [1, 2, 3, 4],
-      query_responses: [],
-      field_prime: '6864797660130609714981900799081393217269435300143305409394463459185543183397656052122559640661454554977296311391480858037121987999716643812574028291115057151',
-      security_level: 20,
-      generation_time: 0.1,
-      protocol: 'ZK-STARK-MOCK',
-      air_satisfied: true,
-      statement,
-      proof_system: 'AIR + FRI (Mock)',
-      public_output: { verified: true, proofType, timestamp: Date.now() },
-    };
-
-    return {
-      proof: mockProof,
-      proofHash: mockProof.trace_merkle_root,
-      proofType,
-      verified: true,
-      generationTime: 100,
-      protocol: 'ZK-STARK-MOCK',
-    };
   }
 
   /**
